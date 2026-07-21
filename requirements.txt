@@ -1,0 +1,4 @@
+requests>=2.31.0
+websocket-client>=1.7.0
+win11toast>=0.35
+pyinstaller>=6.0.0

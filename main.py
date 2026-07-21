@@ -21,6 +21,7 @@ import webbrowser
 from datetime import datetime
 
 import requests
+import certifi
 
 try:
     import websocket  # pip install websocket-client
@@ -58,6 +59,13 @@ HEARTBEAT_IGNORE_TYPE = "heartbeat"
 
 AVATAR_CACHE_EXPIRE = 24 * 60 * 60  # 头像本地缓存 24 小时
 PRIVACY_PLACEHOLDER = "你有一条新的消息"
+
+# 部分 Windows 环境找不到系统根证书，导致 SSL: CERTIFICATE_VERIFY_FAILED，
+# 这里显式指定 certifi 提供的证书包路径来解决。
+try:
+    CA_BUNDLE = certifi.where()
+except Exception:
+    CA_BUNDLE = None
 
 # 配色（浅色现代风）
 COLOR_BG = "#f5f6fa"
@@ -114,6 +122,8 @@ def build_session(client_id: str, uid: str) -> requests.Session:
         "User-Agent": USER_AGENT,
         "Referer": "https://www.luogu.com.cn/",
     })
+    if CA_BUNDLE:
+        s.verify = CA_BUNDLE
     # 洛谷通过 Cookie 中的 __client_id + _uid 识别登录态
     s.cookies.set("__client_id", client_id, domain="www.luogu.com.cn")
     s.cookies.set("_uid", uid, domain="www.luogu.com.cn")
@@ -288,8 +298,10 @@ class ChatListener(threading.Thread):
             on_error=on_error,
             on_close=on_close,
         )
-        # ping_interval 做心跳保活，30s 一次
-        self.ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        # ping_interval 做心跳保活，30s 一次；显式指定证书包避免部分电脑上的
+        # SSL: CERTIFICATE_VERIFY_FAILED 报错
+        sslopt = {"ca_certs": CA_BUNDLE} if CA_BUNDLE else None
+        self.ws_app.run_forever(ping_interval=30, ping_timeout=10, sslopt=sslopt)
 
 
 # ======================== 系统通知 ========================
@@ -310,7 +322,8 @@ def get_local_avatar_path(sender_uid):
         if os.path.exists(local_path) and (time.time() - os.path.getmtime(local_path) < AVATAR_CACHE_EXPIRE):
             return os.path.abspath(local_path)
         url = f"https://cdn.luogu.com.cn/upload/usericon/{sender_uid}.png"
-        resp = requests.get(url, timeout=8, headers={"User-Agent": USER_AGENT})
+        resp = requests.get(url, timeout=8, headers={"User-Agent": USER_AGENT},
+                             verify=(CA_BUNDLE if CA_BUNDLE else True))
         if resp.status_code == 200 and resp.content:
             with open(local_path, "wb") as f:
                 f.write(resp.content)
@@ -429,8 +442,8 @@ class NotifierApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("560x620")
-        self.minsize(480, 480)
+        self.geometry("560x660")
+        self.minsize(480, 420)
         self.configure(bg=COLOR_BG)
 
         self.event_queue = queue.Queue()
@@ -439,6 +452,9 @@ class NotifierApp(tk.Tk):
 
         cfg0 = load_config()
         self.privacy_mode = tk.BooleanVar(value=bool(cfg0.get("privacy_mode", False)))
+        # 是否接收消息的开关，仅存在于本次运行的内存中，不写入 config.json，
+        # 每次重新打开程序都恢复为默认"接收"状态
+        self.receive_enabled = tk.BooleanVar(value=True)
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -471,6 +487,35 @@ class NotifierApp(tk.Tk):
                                      font=("微软雅黑", 10))
         self.status_text.pack(side="right", padx=(0, 4), pady=25)
 
+        # 底部按钮栏：优先 pack 到窗口底部（side="bottom"），无论窗口被拉多矮，
+        # 这一整条都会保持贴底可见，中间的日志区会自动收缩让位，而不会把按钮挤没。
+        bottom = tk.Frame(self, bg=COLOR_BG, height=52)
+        bottom.pack(fill="x", side="bottom", padx=16, pady=(4, 12))
+        bottom.pack_propagate(False)
+
+        btn_row = tk.Frame(bottom, bg=COLOR_BG)
+        btn_row.pack(fill="x", expand=True)
+
+        tk.Button(btn_row, text="测试通知", bg="#dcdde1", fg=COLOR_TEXT, relief="flat",
+                  font=("微软雅黑", 9), padx=10, pady=6,
+                  command=self._test_notification).pack(side="left")
+
+        tk.Button(btn_row, text="清空日志", bg="#dcdde1", fg=COLOR_TEXT, relief="flat",
+                  font=("微软雅黑", 9), padx=10, pady=6,
+                  command=self._clear_log).pack(side="left", padx=6)
+
+        self.receive_btn = tk.Button(btn_row, text="⏸ 暂停接收消息", bg="#dcdde1", fg=COLOR_TEXT,
+                                      relief="flat", font=("微软雅黑", 9), padx=10, pady=6,
+                                      command=self._toggle_receive)
+        self.receive_btn.pack(side="left", padx=6)
+
+        self.count_label = tk.Label(btn_row, text="共收到 0 条私信", bg=COLOR_BG, fg=COLOR_MUTED,
+                                     font=("微软雅黑", 9))
+        self.count_label.pack(side="right")
+
+        # 一条分隔线，让底部按钮栏和日志区在视觉上分开
+        tk.Frame(self, bg="#dcdde1", height=1).pack(fill="x", side="bottom")
+
         # 用户信息卡片
         info_card = tk.Frame(self, bg=COLOR_CARD_BG, bd=0)
         info_card.pack(fill="x", padx=16, pady=(16, 8))
@@ -500,7 +545,8 @@ class NotifierApp(tk.Tk):
         )
         self.privacy_check.pack(side="left", padx=14, pady=(6, 10))
 
-        # 消息日志区
+        # 消息日志区（放在最后 pack，自动伸缩填满剩余空间；窗口变矮时它会先收缩，
+        # 而不会影响上面已固定好位置的头部信息和底部按钮栏）
         log_frame = tk.Frame(self, bg=COLOR_BG)
         log_frame.pack(fill="both", expand=True, padx=16, pady=8)
 
@@ -524,22 +570,6 @@ class NotifierApp(tk.Tk):
         self.log_text.tag_config("content", foreground=COLOR_TEXT)
         self.log_text.tag_config("system", foreground=COLOR_MUTED, font=("微软雅黑", 9, "italic"))
 
-        # 底部按钮栏
-        bottom = tk.Frame(self, bg=COLOR_BG)
-        bottom.pack(fill="x", padx=16, pady=(0, 16))
-
-        tk.Button(bottom, text="测试通知", bg="#dcdde1", fg=COLOR_TEXT, relief="flat",
-                  font=("微软雅黑", 9), padx=12, pady=6,
-                  command=self._test_notification).pack(side="left")
-
-        tk.Button(bottom, text="清空日志", bg="#dcdde1", fg=COLOR_TEXT, relief="flat",
-                  font=("微软雅黑", 9), padx=12, pady=6,
-                  command=self._clear_log).pack(side="left", padx=8)
-
-        self.count_label = tk.Label(bottom, text="共收到 0 条私信", bg=COLOR_BG, fg=COLOR_MUTED,
-                                     font=("微软雅黑", 9))
-        self.count_label.pack(side="right")
-
         if not HAS_TOAST:
             self._append_log_system("提示：未安装 win11toast，系统通知将不可用（仍会记录到日志）。"
                                      "可运行 pip install win11toast 后重启程序启用。")
@@ -549,6 +579,15 @@ class NotifierApp(tk.Tk):
     def _open_login_dialog(self):
         cfg = load_config()
         LoginDialog(self, on_saved=self._on_login_saved, existing=cfg)
+
+    def _toggle_receive(self):
+        self.receive_enabled.set(not self.receive_enabled.get())
+        if self.receive_enabled.get():
+            self.receive_btn.config(text="⏸ 暂停接收消息", bg="#dcdde1", fg=COLOR_TEXT)
+            self._append_log_system("已恢复接收消息")
+        else:
+            self.receive_btn.config(text="▶ 已暂停，点击恢复接收", bg=COLOR_WARN, fg="white")
+            self._append_log_system("已暂停接收消息（期间不会弹通知，也不会记录日志）")
 
     def _on_privacy_toggle(self):
         enabled = self.privacy_mode.get()
@@ -595,6 +634,9 @@ class NotifierApp(tk.Tk):
             if detail:
                 self._append_log_system(detail)
         elif etype == "message":
+            if not self.receive_enabled.get():
+                return  # 已暂停接收，静默忽略（不弹通知、不记日志、不计数）
+
             self.msg_count += 1
             self.count_label.config(text=f"共收到 {self.msg_count} 条私信")
             privacy = self.privacy_mode.get()
@@ -646,7 +688,7 @@ class NotifierApp(tk.Tk):
             show_system_notification(APP_NAME, PRIVACY_PLACEHOLDER, sender_uid=None, show_avatar=False)
             self._append_log_system("已触发测试通知（隐私模式）")
         else:
-            show_system_notification("测试通知：来自 banglee", "asd", sender_uid=None, show_avatar=False)
+            show_system_notification("测试通知：来自 test", "test", sender_uid=None, show_avatar=False)
             self._append_log_system("已触发测试通知")
 
     # ---------- 关闭 ----------

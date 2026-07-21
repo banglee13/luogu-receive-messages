@@ -44,7 +44,13 @@
 - `requirements.txt`：Python 依赖列表
 - `build_exe.bat`：一键打包成 exe 的脚本
 
-## 五、隐私模式
+## 五、暂停/恢复接收消息
+
+主界面底部有一个"⏸ 暂停接收消息"按钮，点击后会切换为"▶ 已暂停，点击恢复接收"。
+- 暂停期间：WebSocket 连接仍然保持（不会频繁重连），但收到的消息会被直接忽略——不弹通知、不记日志、不计数
+- 这个状态**不会**保存到 `config.json`，每次重新打开程序都会恢复为默认的"接收"状态
+
+## 六、隐私模式
 
 主界面用户信息卡片下方有一个"隐私模式"开关，默认关闭。
 - **关闭**：通知和窗口日志正常显示发送人姓名、头像、私信内容
@@ -53,7 +59,10 @@
 
 适合在有其他人可能看到你屏幕的场合使用。
 
-## 六、常见问题
+## 七、常见问题
+
+**Q: 报错 SSL: CERTIFICATE_VERIFY_FAILED / unable to get local issuer certificate？**
+A: 这是部分 Windows 电脑（尤其是精简版 Python 环境或某些国产杀毒软件拦截证书链）常见问题，程序本身找不到系统根证书。现在已经修复：程序会用 `certifi` 库自带的证书包来验证 HTTPS/WSS 连接，不再依赖系统证书。请确保执行过 `pip install -r requirements.txt`（里面包含了 `certifi`），如果是用打包好的 exe，需要用**最新版**重新打包一次。
 
 **Q: 登录信息校验失败？**
 A: 大概率是 Cookie 已过期（重新登录网页后 `__client_id` 一般不变，但保险起见建议重新复制一遍两个值），或者复制时带了多余空格。点击主界面右上角"重新设置账号"重新输入即可。
@@ -64,7 +73,7 @@ A: 确认 `pip install win11toast` 是否安装成功；同时检查 Windows 系
 **Q: 想开机自启动？**
 A: 把打包好的 `LuoguPMNotifier.exe` 的快捷方式放进 `Win+R` 输入 `shell:startup` 打开的文件夹里即可。
 
-## 七、原理简述
+## 八、原理简述
 
 - 用你提供的 `__client_id` / `_uid` 作为 Cookie 向洛谷发起认证请求，校验登录态并获取当前用户信息
 - 连接 `wss://ws.luogu.com.cn/ws`，加入 `chat` 频道（`channel_param` 为你的 uid）

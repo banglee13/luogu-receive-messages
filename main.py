@@ -935,6 +935,11 @@ class NotifierApp(tk.Tk):
 
     def _append_log_message(self, time_str, sender, content, privacy=False):
         self.log_text.config(state="normal")
+        try:
+            if self.log_text.get("end-2c", "end-1c") != "\n":
+                self.log_text.insert("end", "\n")
+        except tk.TclError:
+            pass
         self.log_text.insert("end", f"[{time_str}] ", "time")
         if privacy:
             self.log_text.insert("end", f"{content}\n", "system")

@@ -15,6 +15,8 @@ import os
 import sys
 import json
 import time
+import re
+import io
 import queue
 import threading
 import webbrowser
@@ -39,11 +41,27 @@ try:
 except Exception:
     HAS_TOAST = False
 
+# 图片渲染（可选依赖，缺失时 Markdown 图片会退化为可点击的文字链接）
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
+# LaTeX 公式渲染（可选依赖，基于 matplotlib 的 mathtext 引擎，不需要安装完整 TeX）
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import mathtext
+    HAS_LATEX = True
+except Exception:
+    HAS_LATEX = False
+
 
 # ======================== 常量配置 ========================
 
 APP_NAME = "洛谷私信通知助手"
-APP_VERSION = "1.0"
+APP_VERSION = "1.2.0"
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 LuoguPMNotifier/" + APP_VERSION)
 
@@ -59,6 +77,11 @@ HEARTBEAT_IGNORE_TYPE = "heartbeat"
 
 AVATAR_CACHE_EXPIRE = 24 * 60 * 60  # 头像本地缓存 24 小时
 PRIVACY_PLACEHOLDER = "你有一条新的消息"
+
+# “重新连接测试连通性”按钮的防刷限制
+MANUAL_RECONNECT_COOLDOWN = 5        # 两次点击之间至少间隔（秒）
+MANUAL_RECONNECT_WINDOW = 60         # 统计窗口（秒）
+MANUAL_RECONNECT_MAX_IN_WINDOW = 4   # 窗口内最多允许点击次数
 
 # 部分 Windows 环境找不到系统根证书，导致 SSL: CERTIFICATE_VERIFY_FAILED，
 # 这里显式指定 certifi 提供的证书包路径来解决。
@@ -78,6 +101,62 @@ COLOR_OK = "#27ae60"
 COLOR_WARN = "#e1b12c"
 COLOR_ERR = "#c0392b"
 COLOR_CARD_BG = "#ffffff"
+
+
+# ======================== Markdown / LaTeX 渲染 ========================
+# 支持：**粗体** *斜体* `代码` > 引用  1. 有序列表  - 无序列表  ![alt](图片url)  [文字](链接url)
+# LaTeX：$行内公式$ 和 $$块级公式$$（可选，依赖 matplotlib 的 mathtext 引擎渲染成图片嵌入）
+#
+# 行内 token 的正则表达式。每个 token 都带唯一命名分组，方便用 groupdict() 判断具体类型，
+# 同时又能作为普通字符串直接用 "|" 拼进一个大正则里（而不是嵌套 group 导致 lastgroup 出错）。
+_INLINE_TOKEN_SPECS = [
+    ("markdown", r"!\[(?P<image_alt>[^\]]*)\]\((?P<image_url>[^)\s]+)\)"),
+    ("markdown", r"\[(?P<link_text>[^\]]*)\]\((?P<link_url>[^)\s]+)\)"),
+    ("latex", r"\$\$(?P<latexb_expr>.+?)\$\$"),
+    ("latex", r"\$(?P<latexi_expr>[^\$\n]+?)\$"),
+    ("markdown", r"\*\*(?P<bold_text>.+?)\*\*"),
+    ("markdown", r"`(?P<code_text>[^`]+?)`"),
+    ("markdown", r"\*(?P<italic_text>[^\*\n]+?)\*"),
+]
+
+
+def _build_inline_pattern(markdown_on, latex_on):
+    parts = [pat for kind, pat in _INLINE_TOKEN_SPECS
+             if (kind == "markdown" and markdown_on) or (kind == "latex" and latex_on)]
+    if not parts:
+        return None
+    return re.compile("|".join(parts), re.S)
+
+
+def strip_markdown_full(raw_text):
+    """
+    把 Markdown/LaTeX 标记全部转换成通知里能看懂的纯文本。
+    系统通知（Windows Toast）无法渲染富文本样式，所以这里始终做“去标记”处理，
+    不受“渲染 Markdown”开关影响——开关只控制窗口内日志区是否显示格式化效果。
+    """
+    text = raw_text
+    text = re.sub(r'!\[([^\]]*)\]\([^)]+\)', lambda m: f"[图片{'：' + m.group(1) if m.group(1) else ''}]", text)
+    text = re.sub(r'\[([^\]]*)\]\([^)]+\)', lambda m: m.group(1) or "[链接]", text)
+    text = re.sub(r'\$\$(.+?)\$\$', lambda m: f"[公式: {m.group(1).strip()}]", text, flags=re.S)
+    text = re.sub(r'\$([^\$\n]+?)\$', lambda m: f"[公式: {m.group(1).strip()}]", text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'`([^`]+?)`', r'\1', text)
+    text = re.sub(r'(?m)^>\s?', '', text)
+    text = re.sub(r'(?m)^[-*]\s+', '• ', text)
+    return text
+
+
+def render_latex_png(expr):
+    """用 matplotlib 的 mathtext 引擎把 LaTeX 风格公式渲染成 PNG 字节数据（不需要安装完整 TeX）。"""
+    if not HAS_LATEX or not expr.strip():
+        return None
+    try:
+        buf = io.BytesIO()
+        mathtext.math_to_image(f"${expr}$", buf, dpi=170, format="png", color="#2f3542")
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 # ======================== 配置文件读写 ========================
@@ -436,6 +515,82 @@ class LoginDialog(tk.Toplevel):
             self.destroy()
 
 
+# ======================== 设置面板 ========================
+
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, master, render_markdown_var, on_markdown_toggle,
+                 render_latex_var, on_latex_toggle):
+        super().__init__(master)
+        self.title("设置")
+        self.geometry("440x560")
+        self.resizable(False, False)
+        self.configure(bg=COLOR_BG)
+        self.transient(master)
+        self.grab_set()
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Settings.TCheckbutton", background=COLOR_CARD_BG, foreground=COLOR_TEXT,
+                         font=("微软雅黑", 10))
+        style.map("Settings.TCheckbutton", background=[("active", COLOR_CARD_BG)])
+
+        tk.Label(self, text="设置", bg=COLOR_BG, fg=COLOR_TEXT,
+                 font=("微软雅黑", 14, "bold")).pack(anchor="w", padx=24, pady=(20, 12))
+
+        # 版本信息
+        version_card = tk.Frame(self, bg=COLOR_CARD_BG)
+        version_card.pack(fill="x", padx=24, pady=(0, 12))
+        tk.Label(version_card, text=APP_NAME, bg=COLOR_CARD_BG, fg=COLOR_TEXT,
+                 font=("微软雅黑", 10, "bold")).pack(anchor="w", padx=14, pady=(10, 0))
+        tk.Label(version_card, text=f"版本 v{APP_VERSION}", bg=COLOR_CARD_BG, fg=COLOR_MUTED,
+                 font=("微软雅黑", 9)).pack(anchor="w", padx=14, pady=(0, 10))
+
+        # Markdown 渲染开关
+        md_card = tk.Frame(self, bg=COLOR_CARD_BG)
+        md_card.pack(fill="x", padx=24, pady=(0, 12))
+        ttk.Checkbutton(
+            md_card, text="渲染 Markdown 格式", variable=render_markdown_var,
+            style="Settings.TCheckbutton", command=on_markdown_toggle
+        ).pack(anchor="w", padx=14, pady=(10, 2))
+        md_tip = "支持 **粗体** *斜体* `代码` > 引用 1. 有序列表 - 无序列表 ![图片](url) [链接](url)"
+        tk.Label(md_card, text=md_tip, bg=COLOR_CARD_BG, fg=COLOR_MUTED, font=("微软雅黑", 8),
+                 wraplength=370, justify="left").pack(anchor="w", padx=14, pady=(0, 10))
+
+        # LaTeX 渲染开关
+        latex_card = tk.Frame(self, bg=COLOR_CARD_BG)
+        latex_card.pack(fill="x", padx=24, pady=(0, 12))
+        ttk.Checkbutton(
+            latex_card, text="渲染 LaTeX 公式（$公式$ 或 $$公式$$）", variable=render_latex_var,
+            style="Settings.TCheckbutton", command=on_latex_toggle
+        ).pack(anchor="w", padx=14, pady=(10, 2))
+        latex_tip = ("基于 Matplotlib 的 mathtext 引擎渲染成图片显示，支持常见数学符号、上下标、"
+                      "分数、希腊字母等，不是完整的 LaTeX 排版系统。" if HAS_LATEX else
+                      "未检测到 matplotlib，无法渲染公式。运行 pip install matplotlib 后重启程序即可启用。")
+        tk.Label(latex_card, text=latex_tip, bg=COLOR_CARD_BG, fg=COLOR_MUTED, font=("微软雅黑", 8),
+                 wraplength=370, justify="left").pack(anchor="w", padx=14, pady=(0, 10))
+
+        # 通知权限
+        notif_card = tk.Frame(self, bg=COLOR_CARD_BG)
+        notif_card.pack(fill="x", padx=24, pady=(0, 12))
+        tk.Label(notif_card, text="通知权限", bg=COLOR_CARD_BG, fg=COLOR_TEXT,
+                 font=("微软雅黑", 10, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
+        tip = "如果收不到私信的系统弹窗提醒，请确认 Windows 已允许本程序发送通知。"
+        tk.Label(notif_card, text=tip, bg=COLOR_CARD_BG, fg=COLOR_MUTED, font=("微软雅黑", 9),
+                 wraplength=370, justify="left").pack(anchor="w", padx=14)
+        tk.Button(notif_card, text="打开 Windows 通知设置", bg=COLOR_ACCENT, fg="white", relief="flat",
+                  font=("微软雅黑", 9), padx=10, pady=6,
+                  command=self._open_notification_settings).pack(anchor="w", padx=14, pady=(8, 12))
+
+        tk.Button(self, text="关闭", bg="#dcdde1", fg=COLOR_TEXT, relief="flat",
+                  font=("微软雅黑", 9), padx=16, pady=6, command=self.destroy).pack(pady=16)
+
+    def _open_notification_settings(self):
+        try:
+            os.startfile("ms-settings:notifications")
+        except Exception:
+            messagebox.showinfo("提示", "无法自动打开设置，请手动进入 Windows 设置 → 系统 → 通知 进行设置。")
+
+
 # ======================== 主窗口 ========================
 
 class NotifierApp(tk.Tk):
@@ -455,6 +610,18 @@ class NotifierApp(tk.Tk):
         # 是否接收消息的开关，仅存在于本次运行的内存中，不写入 config.json，
         # 每次重新打开程序都恢复为默认"接收"状态
         self.receive_enabled = tk.BooleanVar(value=True)
+        # Markdown 渲染开关，默认开启，状态持久化到 config.json
+        self.render_markdown = tk.BooleanVar(value=bool(cfg0.get("render_markdown", True)))
+        # LaTeX 公式渲染开关，默认关闭（依赖 matplotlib，体积较大，按需开启）
+        self.render_latex = tk.BooleanVar(value=bool(cfg0.get("render_latex", False)) and HAS_LATEX)
+
+        # 图片 / 公式异步渲染用：唯一标记计数器 + PhotoImage 引用列表（防止被垃圾回收）
+        self._media_counter = 0
+        self._media_refs = []
+
+        # “重新连接测试连通性”按钮防刷相关状态
+        self._reconnect_click_times = []
+        self._last_reconnect_click = 0
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -487,6 +654,12 @@ class NotifierApp(tk.Tk):
                                      font=("微软雅黑", 10))
         self.status_text.pack(side="right", padx=(0, 4), pady=25)
 
+        self.settings_btn = tk.Button(header, text="⚙ 设置", bg=COLOR_HEADER_BG, fg=COLOR_HEADER_FG,
+                                       relief="flat", bd=0, font=("微软雅黑", 9),
+                                       activebackground="#3c4454", activeforeground="white",
+                                       command=self._open_settings)
+        self.settings_btn.pack(side="right", padx=(0, 16), pady=25)
+
         # 底部按钮栏：优先 pack 到窗口底部（side="bottom"），无论窗口被拉多矮，
         # 这一整条都会保持贴底可见，中间的日志区会自动收缩让位，而不会把按钮挤没。
         bottom = tk.Frame(self, bg=COLOR_BG, height=52)
@@ -508,6 +681,10 @@ class NotifierApp(tk.Tk):
                                       relief="flat", font=("微软雅黑", 9), padx=10, pady=6,
                                       command=self._toggle_receive)
         self.receive_btn.pack(side="left", padx=6)
+
+        tk.Button(btn_row, text="🔄 重新连接", bg="#dcdde1", fg=COLOR_TEXT, relief="flat",
+                  font=("微软雅黑", 9), padx=10, pady=6,
+                  command=self._on_reconnect_click).pack(side="left", padx=6)
 
         self.count_label = tk.Label(btn_row, text="共收到 0 条私信", bg=COLOR_BG, fg=COLOR_MUTED,
                                      font=("微软雅黑", 9))
@@ -569,10 +746,23 @@ class NotifierApp(tk.Tk):
         self.log_text.tag_config("sender", foreground=COLOR_ACCENT, font=("微软雅黑", 10, "bold"))
         self.log_text.tag_config("content", foreground=COLOR_TEXT)
         self.log_text.tag_config("system", foreground=COLOR_MUTED, font=("微软雅黑", 9, "italic"))
+        self.log_text.tag_config("md_bold", foreground=COLOR_TEXT, font=("微软雅黑", 10, "bold"))
+        self.log_text.tag_config("md_italic", foreground=COLOR_TEXT, font=("微软雅黑", 10, "italic"))
+        self.log_text.tag_config("md_code", foreground="#c0392b", background="#f1f2f6",
+                                  font=("Consolas", 9))
+        self.log_text.tag_config("md_quote", foreground=COLOR_MUTED, font=("微软雅黑", 10, "italic"),
+                                  lmargin1=24, lmargin2=24)
+        self.log_text.tag_config("md_quote_bar", foreground=COLOR_ACCENT, font=("微软雅黑", 10, "bold"))
+        self.log_text.tag_config("md_list", lmargin1=20, lmargin2=34)
+        self.log_text.tag_config("md_link", foreground=COLOR_ACCENT, underline=True)
+        self.log_text.tag_config("md_media_loading", foreground=COLOR_MUTED, font=("微软雅黑", 9, "italic"))
 
         if not HAS_TOAST:
             self._append_log_system("提示：未安装 win11toast，系统通知将不可用（仍会记录到日志）。"
                                      "可运行 pip install win11toast 后重启程序启用。")
+        if not HAS_PIL:
+            self._append_log_system("提示：未安装 Pillow，Markdown 图片将退化为可点击的文字链接。"
+                                     "可运行 pip install Pillow 后重启程序启用图片显示。")
 
     # ---------- 登录流程 ----------
 
@@ -593,6 +783,82 @@ class NotifierApp(tk.Tk):
         enabled = self.privacy_mode.get()
         save_config({"privacy_mode": enabled})
         self._append_log_system(f"隐私模式已{'开启' if enabled else '关闭'}")
+
+    def _on_markdown_toggle(self):
+        enabled = self.render_markdown.get()
+        save_config({"render_markdown": enabled})
+        self._append_log_system(f"Markdown 渲染已{'开启' if enabled else '关闭'}")
+
+    def _on_latex_toggle(self):
+        if self.render_latex.get() and not HAS_LATEX:
+            self.render_latex.set(False)
+            messagebox.showwarning(
+                "缺少依赖",
+                "渲染 LaTeX 公式需要安装 matplotlib。\n\n请运行：pip install matplotlib\n然后重启程序再试。"
+            )
+            return
+        enabled = self.render_latex.get()
+        save_config({"render_latex": enabled})
+        self._append_log_system(f"LaTeX 渲染已{'开启' if enabled else '关闭'}")
+
+    def _open_settings(self):
+        SettingsDialog(self, render_markdown_var=self.render_markdown,
+                        on_markdown_toggle=self._on_markdown_toggle,
+                        render_latex_var=self.render_latex,
+                        on_latex_toggle=self._on_latex_toggle)
+
+    def _maybe_show_notification_reminder(self):
+        """首次登录成功后，一次性提醒用户检查 Windows 通知权限（此后不再自动弹出，但设置面板里始终能手动打开）。"""
+        cfg = load_config()
+        if cfg.get("notif_reminder_shown"):
+            return
+        save_config({"notif_reminder_shown": True})
+        if not HAS_TOAST:
+            self._append_log_system("未安装 win11toast，无法弹出系统通知，跳过通知权限检查提醒。")
+            return
+        answer = messagebox.askyesno(
+            "开启通知权限",
+            "为了能正常收到私信弹窗提醒，请确认 Windows 已允许本程序发送通知。\n\n"
+            "是否现在打开 Windows 通知设置进行检查？（以后可以在“设置”里重新打开）"
+        )
+        if answer:
+            try:
+                os.startfile("ms-settings:notifications")
+            except Exception:
+                messagebox.showinfo("提示", "无法自动打开设置，请手动进入 Windows 设置 → 系统 → 通知 进行检查。")
+
+    def _on_reconnect_click(self):
+        now = time.time()
+        # 清理窗口外的旧记录
+        self._reconnect_click_times = [t for t in self._reconnect_click_times
+                                        if now - t < MANUAL_RECONNECT_WINDOW]
+
+        if now - self._last_reconnect_click < MANUAL_RECONNECT_COOLDOWN:
+            remaining = MANUAL_RECONNECT_COOLDOWN - (now - self._last_reconnect_click)
+            messagebox.showwarning("点击太快了", f"请等待 {remaining:.0f} 秒后再试一次。")
+            return
+
+        if len(self._reconnect_click_times) >= MANUAL_RECONNECT_MAX_IN_WINDOW:
+            messagebox.showwarning(
+                "操作过于频繁",
+                f"最近 {MANUAL_RECONNECT_WINDOW} 秒内你已经尝试重新连接 {len(self._reconnect_click_times)} 次。\n\n"
+                "频繁重连可能给洛谷服务器带来不必要的压力，也可能被判定为异常行为，请稍等一会儿再试。"
+            )
+            return
+
+        self._last_reconnect_click = now
+        self._reconnect_click_times.append(now)
+        self._manual_reconnect()
+
+    def _manual_reconnect(self):
+        self._append_log_system("正在手动重新连接，测试连通性...")
+        if self.listener:
+            self.listener.stop()
+        cfg = load_config()
+        if cfg.get("client_id") and cfg.get("uid"):
+            self._start_listener(cfg["client_id"], cfg["uid"])
+        else:
+            self._append_log_system("尚未配置账号信息，无法重新连接。")
 
     def _on_login_saved(self, client_id, uid):
         if self.listener:
@@ -619,6 +885,7 @@ class NotifierApp(tk.Tk):
         etype = event.get("type")
         if etype == "login_ok":
             self.user_label.config(text=f"已登录：{event['name']}（UID: {event['uid']}）")
+            self._maybe_show_notification_reminder()
         elif etype == "status":
             value = event.get("value")
             detail = event.get("detail", "")
@@ -633,6 +900,10 @@ class NotifierApp(tk.Tk):
             self.status_text.config(text=text)
             if detail:
                 self._append_log_system(detail)
+        elif etype == "media_ready":
+            self._embed_media(event)
+        elif etype == "media_failed":
+            self._replace_media_placeholder(event["start_mark"], event["end_mark"], event["text"])
         elif etype == "message":
             if not self.receive_enabled.get():
                 return  # 已暂停接收，静默忽略（不弹通知、不记日志、不计数）
@@ -651,9 +922,11 @@ class NotifierApp(tk.Tk):
                 )
             else:
                 self._append_log_message(event["time"], event["sender_name"], event["content"])
+                # 系统通知（Windows Toast）无法渲染富文本样式，因此这里始终显示“去标记”后的
+                # 纯文本，不受“渲染 Markdown”开关影响——避免开关关闭时通知里出现一堆 ** 符号。
                 show_system_notification(
                     title=f"新私信：来自 {event['sender_name']}",
-                    body=event["content"],
+                    body=strip_markdown_full(event["content"]),
                     sender_uid=event.get("sender_uid"),
                     show_avatar=True,
                 )
@@ -667,8 +940,171 @@ class NotifierApp(tk.Tk):
             self.log_text.insert("end", f"{content}\n", "system")
         else:
             self.log_text.insert("end", f"{sender}: ", "sender")
-            self.log_text.insert("end", f"{content}\n", "content")
+            self._render_message_to_log(content)
         self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+    def _render_message_to_log(self, content):
+        """按当前“渲染 Markdown / LaTeX”开关状态，把消息内容解析后插入日志区（末尾自动换行）。
+        调用方需要自行确保 log_text 已经是 state='normal'。"""
+        markdown_on = self.render_markdown.get()
+        latex_on = self.render_latex.get() and HAS_LATEX
+
+        if not markdown_on and not latex_on:
+            self.log_text.insert("end", content + "\n", "content")
+            return
+
+        lines = content.split("\n")
+        for i, line in enumerate(lines):
+            remainder = line
+            base_tag = "content"
+
+            if markdown_on:
+                if line.startswith(">"):
+                    remainder = line[1:].lstrip(" ")
+                    base_tag = "md_quote"
+                    self.log_text.insert("end", "▎ ", "md_quote_bar")
+                elif re.match(r"^\d+\.\s+", line):
+                    base_tag = "md_list"
+                elif re.match(r"^[-*]\s+", line):
+                    remainder = "• " + re.sub(r"^[-*]\s+", "", line)
+                    base_tag = "md_list"
+
+            self._insert_inline(remainder, base_tag, markdown_on, latex_on)
+            if i < len(lines) - 1:
+                self.log_text.insert("end", "\n")
+        self.log_text.insert("end", "\n")
+
+    def _insert_inline(self, text, base_tag, markdown_on, latex_on):
+        pattern = _build_inline_pattern(markdown_on, latex_on)
+        if pattern is None:
+            if text:
+                self.log_text.insert("end", text, base_tag)
+            return
+        pos = 0
+        for m in pattern.finditer(text):
+            if m.start() > pos:
+                self.log_text.insert("end", text[pos:m.start()], base_tag)
+            gd = m.groupdict()
+            if gd.get("image_url") is not None:
+                self._insert_image(gd.get("image_alt") or "", gd["image_url"])
+            elif gd.get("link_url") is not None:
+                self._insert_link(gd.get("link_text") or gd["link_url"], gd["link_url"])
+            elif gd.get("latexb_expr") is not None:
+                self._insert_latex(gd["latexb_expr"].strip())
+            elif gd.get("latexi_expr") is not None:
+                self._insert_latex(gd["latexi_expr"].strip())
+            elif gd.get("bold_text") is not None:
+                self.log_text.insert("end", gd["bold_text"], "md_bold")
+            elif gd.get("code_text") is not None:
+                self.log_text.insert("end", gd["code_text"], "md_code")
+            elif gd.get("italic_text") is not None:
+                self.log_text.insert("end", gd["italic_text"], "md_italic")
+            pos = m.end()
+        if pos < len(text):
+            self.log_text.insert("end", text[pos:], base_tag)
+
+    def _insert_link(self, text, url):
+        tag_name = f"link_{self._media_counter}"
+        self._media_counter += 1
+        self.log_text.insert("end", text, ("md_link", tag_name))
+        self.log_text.tag_bind(tag_name, "<Button-1>", lambda e, u=url: webbrowser.open(u))
+        self.log_text.tag_bind(tag_name, "<Enter>", lambda e: self.log_text.config(cursor="hand2"))
+        self.log_text.tag_bind(tag_name, "<Leave>", lambda e: self.log_text.config(cursor=""))
+
+    def _insert_image(self, alt, url):
+        if not HAS_PIL:
+            # 没装 Pillow，退化为可点击的文字链接，点击后用浏览器打开原图
+            self._insert_link(f"🖼 {alt or '图片'}（点击查看）", url)
+            return
+
+        start_mark = f"media_{self._media_counter}_s"
+        end_mark = f"media_{self._media_counter}_e"
+        self._media_counter += 1
+        self.log_text.mark_set(start_mark, "end")
+        self.log_text.mark_gravity(start_mark, "left")
+        self.log_text.insert("end", f"🖼 {alt or '图片'} 加载中...", "md_media_loading")
+        self.log_text.mark_set(end_mark, "end")
+        self.log_text.mark_gravity(end_mark, "right")
+
+        def worker():
+            try:
+                resp = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT},
+                                     verify=(CA_BUNDLE if CA_BUNDLE else True))
+                if resp.status_code == 200 and resp.content:
+                    self.event_queue.put({
+                        "type": "media_ready", "kind": "image",
+                        "start_mark": start_mark, "end_mark": end_mark, "data": resp.content,
+                    })
+                    return
+            except Exception:
+                pass
+            self.event_queue.put({"type": "media_failed", "start_mark": start_mark,
+                                   "end_mark": end_mark, "text": "[图片加载失败]"})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _insert_latex(self, expr):
+        if not expr:
+            return
+        if not (HAS_LATEX and self.render_latex.get()):
+            # 未安装 matplotlib 或未开启该选项时，保留原始公式文本，只做等宽字体展示
+            self.log_text.insert("end", f"${expr}$", "md_code")
+            return
+
+        start_mark = f"media_{self._media_counter}_s"
+        end_mark = f"media_{self._media_counter}_e"
+        self._media_counter += 1
+        self.log_text.mark_set(start_mark, "end")
+        self.log_text.mark_gravity(start_mark, "left")
+        self.log_text.insert("end", f"∑ {expr} 公式渲染中...", "md_media_loading")
+        self.log_text.mark_set(end_mark, "end")
+        self.log_text.mark_gravity(end_mark, "right")
+
+        def worker():
+            png_bytes = render_latex_png(expr)
+            if png_bytes:
+                self.event_queue.put({
+                    "type": "media_ready", "kind": "latex",
+                    "start_mark": start_mark, "end_mark": end_mark, "data": png_bytes,
+                })
+            else:
+                self.event_queue.put({"type": "media_failed", "start_mark": start_mark,
+                                       "end_mark": end_mark, "text": f"[公式渲染失败: {expr}]"})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _embed_media(self, event):
+        """在主线程里把下载/渲染好的图片字节数据转换成 PhotoImage 并嵌入日志区，替换占位文字。"""
+        start_mark, end_mark, kind = event["start_mark"], event["end_mark"], event["kind"]
+        try:
+            img = Image.open(io.BytesIO(event["data"]))
+            if kind == "image":
+                img.thumbnail((320, 320))
+            else:  # latex 公式图一般较小，限制一个较大的上限即可
+                img.thumbnail((520, 200))
+            photo = ImageTk.PhotoImage(img)
+        except Exception:
+            self._replace_media_placeholder(start_mark, end_mark, "[媒体加载失败]")
+            return
+
+        self._media_refs.append(photo)  # 防止 Tkinter 提前回收图片对象导致画面空白
+        self.log_text.config(state="normal")
+        try:
+            self.log_text.delete(start_mark, end_mark)
+            self.log_text.image_create(start_mark, image=photo)
+        except Exception:
+            pass
+        self.log_text.config(state="disabled")
+        self.log_text.see("end")
+
+    def _replace_media_placeholder(self, start_mark, end_mark, text):
+        self.log_text.config(state="normal")
+        try:
+            self.log_text.delete(start_mark, end_mark)
+            self.log_text.insert(start_mark, text, "system")
+        except Exception:
+            pass
         self.log_text.config(state="disabled")
 
     def _append_log_system(self, text):
@@ -688,7 +1124,7 @@ class NotifierApp(tk.Tk):
             show_system_notification(APP_NAME, PRIVACY_PLACEHOLDER, sender_uid=None, show_avatar=False)
             self._append_log_system("已触发测试通知（隐私模式）")
         else:
-            show_system_notification("测试通知：来自 test", "test", sender_uid=None, show_avatar=False)
+            show_system_notification("测试通知：来自 test", "123abc", sender_uid=None, show_avatar=False)
             self._append_log_system("已触发测试通知")
 
     # ---------- 关闭 ----------
